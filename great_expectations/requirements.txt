@@ -1,0 +1,5 @@
+great-expectations[postgresql]==1.21.0
+deltalake
+pyarrow
+pandas
+psycopg2-binary
