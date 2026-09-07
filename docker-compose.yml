@@ -1,0 +1,726 @@
+x-airflow-common:
+  &airflow-common
+  build: ./airflow
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # Le conteneur tourne en root (user: "0:0", requis pour le socket Docker),
+    # mais Airflow est installé via "pip install --user" sous l'utilisateur
+    # airflow -- HOME doit rester /home/airflow pour que Python retrouve ces
+    # paquets, sinon "import airflow" échoue (HOME=/root par défaut pour root).
+    HOME: /home/airflow
+    # Chemin absolu du projet, identique dedans et dehors -- nécessaire pour
+    # que "docker compose run" lancé DEPUIS ce conteneur résolve les volumes
+    # relatifs (./spark, ./delta-storage) de la même façon que lorsque tu le
+    # lances toi-même depuis ton terminal.
+    PROJECT_ROOT: ${PROJECT_ROOT}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/plugins:/opt/airflow/plugins
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ${PROJECT_ROOT}:${PROJECT_ROOT}
+  user: "0:0"   # simplification POC : nécessaire pour l'accès au socket Docker (voir spark-streaming-bronze pour le même compromis)
+  depends_on:
+    &airflow-common-depends-on
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+
+  # ------------------------------------------------------------
+  # Couche 1 : Stockage SOURCE (référentiels + activités)
+  # ------------------------------------------------------------
+  postgres-source:
+    image: postgres:16
+    container_name: postgres-source
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sportdata
+      POSTGRES_PASSWORD: sportdata_pwd   # à remplacer par un secret réel, jamais en clair en vrai projet
+      POSTGRES_DB: sportdata_source
+    ports:
+      - "5432:5432"   # accès depuis l'hôte (psql, DBeaver...) pour debug
+    volumes:
+      - postgres_source_data:/var/lib/postgresql/data
+      - ${PROJECT_ROOT}/sql/source:/docker-entrypoint-initdb.d   # UNIQUEMENT le SQL destiné à ce conteneur (schéma seul)
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"        # requis par Debezium (CDC)
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "max_replication_slots=4"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sportdata -d sportdata_source"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------
+  # Couche 3 : Stockage MIROIR (dédié à PowerBI)
+  # ------------------------------------------------------------
+  postgres-mirror:
+    image: postgres:16
+    container_name: postgres-mirror
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sportdata
+      POSTGRES_PASSWORD: sportdata_pwd   # à remplacer par un secret réel, jamais en clair en vrai projet
+      POSTGRES_DB: sportdata_mirror
+    ports:
+      - "5433:5432"   # 5433 côté hôte : 5432 est déjà pris par postgres-source
+    volumes:
+      - postgres_mirror_data:/var/lib/postgresql/data
+      - ${PROJECT_ROOT}/sql/mirror:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sportdata -d sportdata_mirror"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------
+  # Jobs à la demande — tous sous le profile "tools", ne démarrent
+  # jamais avec un simple `docker compose up`. Les trois partagent
+  # la même image (un seul build), défini une fois sur "loader" et
+  # référencé par nom sur les deux autres.
+  #
+  # Ordre d'exécution à respecter manuellement : loader, PUIS
+  # generateur-historique. Rien dans Compose ne force cet ordre —
+  # ce sont deux jobs ponctuels, pas des services qui tournent en
+  # continu (pas de healthcheck possible sur un job déjà terminé).
+  # ------------------------------------------------------------
+
+  loader:
+    build: ./scripts
+    image: sportdata-scripts:latest
+    container_name: sportdata-loader
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      RH_FILE: /data/dataRH.xlsx
+      SPORT_FILE: /data/dataSport.xlsx
+    volumes:
+      - ${PROJECT_ROOT}/data:/data:ro
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "load_referentiels.py"]
+
+  generateur-historique:
+    build: ./scripts
+    image: sportdata-scripts:latest
+    container_name: sportdata-generateur-historique
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "generate_activites.py"]
+    command: ["--mode", "historique", "--seed", "42"]
+    # Pour ajouter --force ou changer la graine, retaper les arguments en entier :
+    # docker compose --profile tools run --rm generateur-historique --mode historique --seed 42 --force
+
+  generateur-live:
+    build: ./scripts
+    image: sportdata-scripts:latest
+    container_name: sportdata-generateur-live
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "generate_activites.py"]
+    command: ["--mode", "live"]
+    # Pour cibler un salarié précis ou plusieurs activités :
+    # docker compose --profile tools run --rm generateur-live --mode live --employee-id 17757 --live-count 3
+    #
+    # NOTE : ce job devient redondant avec mock-strava-api + strava-collector
+    # ci-dessous, qui simulent désormais l'ingestion live via une vraie API
+    # (auth, pagination, cas limites -- CE2 Compétence 2). Conservé tel quel
+    # comme raccourci de debug local (insertion directe, sans passer par
+    # l'API) ; à retirer si tu ne t'en sers plus.
+
+  # ------------------------------------------------------------
+  # Simule l'ingestion "live" via une API tierce (Strava) : remplace
+  # l'écriture directe en base par un vrai aller-retour API (auth,
+  # pagination, tolérance aux formats invalides) -- cf. CE2 Compétence 2
+  # du guide mentor ("token expiré", "pagination", "format inattendu",
+  # "absence de données"). mock-strava-api génère des activités
+  # plausibles en tâche de fond et les expose via un sous-ensemble
+  # réaliste de l'API Strava v3 ; strava-collector les récupère et les
+  # écrit dans activites_sportives, d'où Debezium prend le relais comme
+  # pour toute autre écriture -- rien ne change en aval.
+  #
+  # Services PERMANENTS (pas des jobs "tools") : tournent en continu,
+  # même logique que spark-streaming-bronze ou slack-notifier.
+  #
+  # Pas de healthcheck sur mock-strava-api : strava-collector encaisse
+  # déjà les erreurs de cycle (try/except autour de poll_once) et
+  # réessaie au poll suivant, donc service_started suffit ici.
+  # ------------------------------------------------------------
+  mock-strava-api:
+    build: ./mock-strava-api
+    image: sportdata-mock-strava-api:latest
+    container_name: mock-strava-api
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET}
+      MOCK_STRAVA_TOKEN_TTL_SECONDS: ${MOCK_STRAVA_TOKEN_TTL_SECONDS}
+      MOCK_STRAVA_GENERATION_INTERVAL_SECONDS: ${MOCK_STRAVA_GENERATION_INTERVAL_SECONDS}
+      MOCK_STRAVA_MALFORMED_RATE: ${MOCK_STRAVA_MALFORMED_RATE}
+    ports:
+      - "8000:8000"   # accès direct depuis l'hôte pour la démo (demo/trigger_live_activity.py)
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+
+  strava-collector:
+    build: ./strava-collector
+    image: sportdata-strava-collector:latest
+    container_name: strava-collector
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      STRAVA_API_BASE_URL: ${STRAVA_API_BASE_URL}
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET}
+      STRAVA_COLLECTOR_POLL_INTERVAL_SECONDS: ${STRAVA_COLLECTOR_POLL_INTERVAL_SECONDS}
+      STRAVA_COLLECTOR_PER_PAGE: ${STRAVA_COLLECTOR_PER_PAGE}
+    depends_on:
+      mock-strava-api:
+        condition: service_started
+      postgres-source:
+        condition: service_healthy
+
+  # ------------------------------------------------------------
+  # Bus d'événements — Redpanda (compatible API Kafka, un seul
+  # nœud pour ce POC). "--mode dev-container" applique des
+  # réglages adaptés au développement en conteneur (mémoire,
+  # cœurs, pas de mode production).
+  # ------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.1
+    container_name: redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=info
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    ports:
+      - "18081:18081"   # Schema Registry
+      - "18082:18082"   # HTTP Proxy
+      - "19092:19092"   # Kafka API (accès depuis l'hôte)
+      - "19644:9644"    # Admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # Interface web pour inspecter les topics et les messages sans CLI
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v3.10.0
+    container_name: redpanda-console
+    restart: unless-stopped
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+        schemaRegistry:
+          enabled: true
+          urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # ------------------------------------------------------------
+  # Debezium (Kafka Connect + connecteur PostgreSQL préinstallé).
+  # Les 3 REPLICATION_FACTOR sont forcés à 1 : Redpanda tourne
+  # avec un seul nœud ici, la valeur par défaut (3) empêcherait
+  # la création des topics internes de Kafka Connect.
+  # ------------------------------------------------------------
+  debezium:
+    image: quay.io/debezium/connect:latest
+    container_name: debezium
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: sportdata-connect
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # ------------------------------------------------------------
+  # Service permanent : consomme sportdata.public.activites_sportives
+  # (deuxième groupe de consommateurs sur le même topic que
+  # spark-streaming-bronze) et poste une notification Slack pour
+  # chaque nouvelle activité captée. Voir slack-notifier/notify_activities.py.
+  # ------------------------------------------------------------
+  slack-notifier:
+    build: ./slack-notifier
+    image: sportdata-slack-notifier:latest
+    container_name: slack-notifier
+    restart: unless-stopped
+    environment:
+      REDPANDA_BOOTSTRAP: redpanda:9092
+      REDPANDA_TOPIC: sportdata.public.activites_sportives
+      SLACK_ACTIVITIES_WEBHOOK_URL: ${SLACK_ACTIVITIES_WEBHOOK_URL}
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres-source:
+        condition: service_healthy
+
+  # ------------------------------------------------------------
+  # Job à la demande : enregistre le connecteur PostgreSQL auprès
+  # de Debezium. PUT (pas POST) sur /connectors/{name}/config :
+  # idempotent, rejouable sans erreur si déjà enregistré.
+  # ------------------------------------------------------------
+  connector-register:
+    image: curlimages/curl:latest
+    container_name: sportdata-connector-register
+    profiles: ["tools"]
+    volumes:
+      - ${PROJECT_ROOT}/debezium:/config:ro
+    depends_on:
+      debezium:
+        condition: service_healthy
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - curl -f -X PUT -H "Content-Type:application/json" --data @/config/register-connector.json http://debezium:8083/connectors/sportdata-activites-connector/config
+
+  # ------------------------------------------------------------
+  # Couche 2 : Traitement — Spark Structured Streaming
+  # Redpanda -> Delta BRONZE (activites_brutes), en continu.
+  #
+  # Service PERMANENT, pas un job ponctuel comme loader/generateur-* :
+  # profile distinct ("streaming", pas "tools") pour ne pas le mélanger
+  # conceptuellement avec les jobs run-once. Démarrage manuel :
+  #   docker compose up -d spark-streaming-bronze
+  # (le nommer explicitement suffit, pas besoin de --profile)
+  # ------------------------------------------------------------
+  spark-streaming-bronze:
+    image: apache/spark:3.5.5-scala2.12-java11-python3-ubuntu
+    container_name: spark-streaming-bronze
+    restart: unless-stopped
+    profiles: ["streaming"]
+    user: "0:0"   # root : le volume delta_data est créé par Docker avec root comme propriétaire,
+                  # l'utilisateur non-root de l'image Spark ne peut pas y écrire sinon.
+                  # Acceptable pour un POC local, à reconsidérer en environnement partagé.
+    volumes:
+      - ${PROJECT_ROOT}/spark:/opt/spark-scripts:ro
+      - ${PROJECT_ROOT}/delta-storage:/opt/delta/analytics
+      - spark_checkpoints:/opt/spark/checkpoints
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-submit
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - io.delta:delta-spark_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5
+      - /opt/spark-scripts/streaming_bronze.py
+
+  # ------------------------------------------------------------
+  # Job BATCH ponctuel : enrichissement silver (bronze + référentiels
+  # + distances domicile-travail). Incrémental -- ne retraite jamais
+  # une activité déjà présente dans activites_enrichies.
+  # Pas de connecteur Kafka nécessaire ici (ne lit pas Redpanda),
+  # mais un pilote JDBC PostgreSQL en plus de Delta.
+  # ------------------------------------------------------------
+  spark-batch-silver:
+    image: apache/spark:3.5.5-scala2.12-java11-python3-ubuntu
+    container_name: spark-batch-silver
+    profiles: ["tools"]
+    user: "0:0"   # même contournement de permission que spark-streaming-bronze
+    volumes:
+      - ${PROJECT_ROOT}/spark:/opt/spark-scripts:ro
+      - ${PROJECT_ROOT}/delta-storage:/opt/delta/analytics
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint:
+      - /opt/spark/bin/spark-submit
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - io.delta:delta-spark_2.12:3.3.2,org.postgresql:postgresql:42.7.13
+      - /opt/spark-scripts/silver_enrich.py
+    command: ["--source", "bronze"]
+    # Pour rattraper l'historique généré en masse par generateur-historique :
+    # docker compose --profile tools run --rm spark-batch-silver --source postgres
+
+  # ------------------------------------------------------------
+  # Job BATCH ponctuel : calcul des indicateurs d'éligibilité (gold).
+  # Recalcul COMPLET à chaque run (pas incrémental, contrairement au
+  # silver) -- nécessaire pour permettre le rejeu si un taux/seuil
+  # change dans parametres_regles.
+  # ------------------------------------------------------------
+  spark-batch-gold:
+    image: apache/spark:3.5.5-scala2.12-java11-python3-ubuntu
+    container_name: spark-batch-gold
+    profiles: ["tools"]
+    user: "0:0"
+    volumes:
+      - ${PROJECT_ROOT}/spark:/opt/spark-scripts:ro
+      - ${PROJECT_ROOT}/delta-storage:/opt/delta/analytics
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint:
+      - /opt/spark/bin/spark-submit
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - io.delta:delta-spark_2.12:3.3.2,org.postgresql:postgresql:42.7.13
+      - /opt/spark-scripts/gold_eligibilite.py
+
+  # ------------------------------------------------------------
+  # Job BATCH ponctuel : synchronise le miroir PostgreSQL (PowerBI)
+  # depuis les référentiels/paramètres (postgres-source) et le gold
+  # (Delta). Dépend des DEUX bases Postgres, pas une seule.
+  # ------------------------------------------------------------
+  sync-mirror:
+    image: apache/spark:3.5.5-scala2.12-java11-python3-ubuntu
+    container_name: sync-mirror
+    profiles: ["tools"]
+    user: "0:0"
+    volumes:
+      - ${PROJECT_ROOT}/spark:/opt/spark-scripts:ro
+      - ${PROJECT_ROOT}/delta-storage:/opt/delta/analytics
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      MIRROR_HOST: postgres-mirror
+      MIRROR_PORT: 5432
+      MIRROR_DATABASE: sportdata_mirror
+      MIRROR_USER: sportdata
+      MIRROR_PASSWORD: sportdata_pwd
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+      postgres-mirror:
+        condition: service_healthy
+    entrypoint:
+      - /opt/spark/bin/spark-submit
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --packages
+      - io.delta:delta-spark_2.12:3.3.2,org.postgresql:postgresql:42.7.13
+      - /opt/spark-scripts/sync_mirror.py
+
+  # ------------------------------------------------------------
+  # Calcule la distance domicile-travail réelle (OpenRouteService)
+  # pour les salariés en mode de trajet vert. Idempotent, ne
+  # recalcule jamais un salarié déjà traité. Nécessite ORS_API_KEY
+  # (inscription gratuite, voir scripts/compute_distances.py).
+  # ------------------------------------------------------------
+  compute-distances:
+    build: ./scripts
+    image: sportdata-scripts:latest
+    container_name: sportdata-compute-distances
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      ORS_API_KEY: ${ORS_API_KEY}
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "compute_distances.py"]
+
+  # ------------------------------------------------------------
+  # Valide la qualité de activites_enrichies (silver) avec Great
+  # Expectations avant que gold ne s'exécute -- voir
+  # great_expectations/validate_silver.py. Sort en erreur (bloquant)
+  # uniquement sur une Expectation critical ; un warning seul (ex.
+  # anomalie_distance) est signalé sans arrêter le pipeline.
+  # Moteur pandas (lecture Delta via `deltalake`, pas de Spark/JVM) --
+  # PGHOST/DELTA_STORAGE_PATH surchargent les défauts du script, pensés
+  # pour une exécution hors Docker : ici on tourne sur le réseau du
+  # projet, donc postgres-source par nom de service, et delta-storage/
+  # monté directement plutôt que résolu en relatif depuis le script.
+  # ------------------------------------------------------------
+  validate-silver:
+    build: ./great_expectations
+    image: sportdata-great-expectations:latest
+    container_name: sportdata-validate-silver
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      DELTA_STORAGE_PATH: /opt/delta
+    volumes:
+      - ${PROJECT_ROOT}/delta-storage:/opt/delta
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "validate_silver.py"]
+
+  # ------------------------------------------------------------
+  # Même principe que validate-silver, mais sur indicateurs_eligibilite
+  # (gold) -- ne valide que le dernier run_date (gold est en append,
+  # pas incrémental comme silver). Voir
+  # great_expectations/validate_gold.py.
+  # ------------------------------------------------------------
+  validate-gold:
+    build: ./great_expectations
+    image: sportdata-great-expectations:latest
+    container_name: sportdata-validate-gold
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+      DELTA_STORAGE_PATH: /opt/delta
+    volumes:
+      - ${PROJECT_ROOT}/delta-storage:/opt/delta
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "validate_gold.py"]
+
+  # ------------------------------------------------------------
+  # Valide referentiel_rh, referentiel_sport, parametres_regles juste
+  # après loader -- rattaché à reset-complet.ps1 uniquement, PAS à
+  # sportdata_pipeline. Voir great_expectations/validate_source.py.
+  # ------------------------------------------------------------
+  validate-source:
+    build: ./great_expectations
+    image: sportdata-great-expectations:latest
+    container_name: sportdata-validate-source
+    profiles: ["tools"]
+    environment:
+      PGHOST: postgres-source
+      PGPORT: 5432
+      PGDATABASE: sportdata_source
+      PGUSER: sportdata
+      PGPASSWORD: sportdata_pwd
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    entrypoint: ["python", "validate_source.py"]
+
+  # ==============================================================
+  # AIRFLOW -- orchestration du pipeline récurrent (compute-distances
+  # -> spark-batch-silver -> spark-batch-gold -> sync-mirror).
+  # Adapté du docker-compose.yaml officiel (CeleryExecutor) en
+  # LocalExecutor -- suppression de redis/worker/flower, inutiles ici.
+  # ==============================================================
+  airflow-postgres:
+    image: postgres:16
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: always
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8081:8080"   # 8080 déjà pris par Debezium -- interface Airflow sur 8081
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        /entrypoint airflow config list >/dev/null
+        chown -R "0:0" /opt/airflow/
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+
+volumes:
+  postgres_source_data:
+  postgres_mirror_data:
+  redpanda_data:
+  spark_checkpoints:
+  airflow-db-volume:
