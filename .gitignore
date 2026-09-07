@@ -1,2 +1,4 @@
 .env
+great_expectations/venv/
+delta-storage/
 demo/
